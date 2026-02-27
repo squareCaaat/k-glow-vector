@@ -7,8 +7,9 @@ import { Button } from "../components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "../components/ui/dialog";
 import { useAuth } from "../context/AuthContext";
 import { supabase } from "../lib/supabase";
+import { searchProducts } from "../lib/search";
 
-interface Product {
+export interface Product {
     id: string;
     name: string;
     brand: string;
@@ -32,6 +33,13 @@ interface SearchMeta {
     top_brands: string[];
     top_tags: string[];
     category_distribution: Record<string, number>;
+}
+
+interface SemanticSearchMeta {
+    model: string;
+    embedding_dim: number;
+    top_similarity: number;
+    avg_similarity: number;
 }
 
 const categoryLabels: Record<string, string> = {
@@ -105,6 +113,8 @@ export default function SearchPage() {
     const { isLoggedIn, user } = useAuth();
 
     const q = searchParams.get("q") ?? "";
+    const categoryFilter = searchParams.get("category") ?? "";
+    const priceBandFilter = searchParams.get("price_band") ?? "";
 
     const [results, setResults] = useState<Product[]>([]);
     const [loading, setLoading] = useState(true);
@@ -113,6 +123,26 @@ export default function SearchPage() {
     const [savedIds, setSavedIds] = useState<string[]>([]);
     const [paymentOpen, setPaymentOpen] = useState(false);
     const [meta, setMeta] = useState<SearchMeta | null>(null);
+    const [semanticMeta, setSemanticMeta] = useState<SemanticSearchMeta | null>(null);
+
+    const toSemanticMeta = (value: unknown): SemanticSearchMeta | null => {
+        if (!value || typeof value !== "object") return null;
+        const obj = value as Record<string, unknown>;
+        if (
+            typeof obj.model === "string" &&
+            typeof obj.embedding_dim === "number" &&
+            typeof obj.top_similarity === "number" &&
+            typeof obj.avg_similarity === "number"
+        ) {
+            return {
+                model: obj.model,
+                embedding_dim: obj.embedding_dim,
+                top_similarity: obj.top_similarity,
+                avg_similarity: obj.avg_similarity,
+            };
+        }
+        return null;
+    };
 
     const fetchSavedIds = useCallback(async () => {
         if (!isLoggedIn || !user) return;
@@ -132,34 +162,29 @@ export default function SearchPage() {
         setLoading(true);
         setActiveCategory("all");
         setVisibleCount(10);
+        setSemanticMeta(null);
 
         const doSearch = async () => {
-            const { data, error } = await supabase.rpc("search_products", { search_query: q });
-
-            if (error || !data || data.length === 0) {
-                // Fallback: return all products if search_products fails or returns nothing
-                const { data: allProducts } = await supabase
-                    .from("products")
-                    .select("id, name, brand, category, price_band, finish, tone_fit, tags, ingredients_top, ingredients_caution, texture_desc, explain_short, explain_detail_points, image_url, similar_ids");
-                const results = (allProducts || []).map(p => ({ ...p, similarity_score: 0.80 }));
-                setResults(results);
-                setMeta(buildSearchMeta(results));
-            } else {
-                setResults(data);
-                setMeta(buildSearchMeta(data));
-            }
+            const searchResult = await searchProducts(q, {
+                category: categoryFilter || undefined,
+                price_band: priceBandFilter || undefined,
+            });
+            const finalResults = searchResult.results || [];
+            setResults(finalResults);
+            setMeta(buildSearchMeta(finalResults));
+            setSemanticMeta(toSemanticMeta(searchResult.search_meta));
 
             // Log the search
             if (isLoggedIn && user) {
                 await supabase.from("search_logs").insert({
                     user_id: user.id,
                     query: q,
-                    result_count: data?.length ?? 0,
+                    result_count: finalResults.length,
                 });
             } else {
                 await supabase.from("search_logs").insert({
                     query: q,
-                    result_count: data?.length ?? 0,
+                    result_count: finalResults.length,
                 });
             }
 
@@ -169,7 +194,7 @@ export default function SearchPage() {
 
         const timer = setTimeout(doSearch, 800);
         return () => clearTimeout(timer);
-    }, [q, navigate, isLoggedIn, user, fetchSavedIds]);
+    }, [q, categoryFilter, priceBandFilter, navigate, isLoggedIn, user, fetchSavedIds]);
 
     const filteredResults = activeCategory === "all"
         ? results
@@ -251,6 +276,12 @@ export default function SearchPage() {
                                         </span>
                                     ))}
                                 </div>
+                            )}
+                            {semanticMeta && (
+                                <p className="text-muted-foreground">
+                                    <span className="font-medium text-foreground">시맨틱 매칭:</span>{" "}
+                                    {semanticMeta.model} ({semanticMeta.embedding_dim}d), top {Math.round(semanticMeta.top_similarity * 100)}%, avg {Math.round(semanticMeta.avg_similarity * 100)}%
+                                </p>
                             )}
                         </div>
                     </div>

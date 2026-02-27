@@ -135,7 +135,8 @@ CREATE TABLE IF NOT EXISTS public.products (
   explain_detail_points   text[] NOT NULL DEFAULT '{}',
   image_url               text,
   similar_ids             text[] NOT NULL DEFAULT '{}',
-  embedding               vector(1536),
+  embedding_text          text,
+  embedding               extensions.vector(384),
   created_at              timestamptz NOT NULL DEFAULT now(),
   updated_at              timestamptz NOT NULL DEFAULT now()
 );
@@ -143,13 +144,100 @@ CREATE TABLE IF NOT EXISTS public.products (
 COMMENT ON TABLE public.products IS '제품 카탈로그 (+ pgvector 임베딩)';
 
 -- Vector similarity search index
-CREATE INDEX IF NOT EXISTS idx_products_embedding
-  ON public.products
-  USING ivfflat (embedding vector_cosine_ops)
-  WITH (lists = 100);
+-- NOTE:
+-- IVFFlat은 데이터 분포로 학습되므로 초기 빈 테이블에서 즉시 생성하지 않는다.
+-- 임베딩 데이터 적재 완료 후 별도 마이그레이션으로 생성할 것.
+-- CREATE INDEX IF NOT EXISTS idx_products_embedding
+--   ON public.products
+--   USING ivfflat (embedding vector_cosine_ops)
+--   WITH (lists = 100);
 
 CREATE INDEX IF NOT EXISTS idx_products_category
   ON public.products (category);
+
+-- 키워드 검색 RPC (AI 검색 실패 시 폴백)
+CREATE OR REPLACE FUNCTION public.search_products(search_query text)
+RETURNS TABLE (
+  id text,
+  name text,
+  brand text,
+  category text,
+  price_band text,
+  finish text,
+  tone_fit text,
+  tags text[],
+  ingredients_top text[],
+  ingredients_caution text[],
+  texture_desc text,
+  explain_short text,
+  explain_detail_points text[],
+  image_url text,
+  similar_ids text[],
+  similarity_score double precision
+)
+LANGUAGE sql STABLE
+SET search_path TO 'public'
+AS $$
+  SELECT
+    p.id,
+    p.name,
+    p.brand,
+    p.category,
+    p.price_band,
+    p.finish,
+    p.tone_fit,
+    p.tags,
+    p.ingredients_top,
+    p.ingredients_caution,
+    p.texture_desc,
+    p.explain_short,
+    p.explain_detail_points,
+    p.image_url,
+    p.similar_ids,
+    (
+      CASE WHEN p.name ILIKE '%' || search_query || '%' THEN 0.40 ELSE 0 END +
+      CASE WHEN p.brand ILIKE '%' || search_query || '%' THEN 0.20 ELSE 0 END +
+      CASE WHEN p.category ILIKE '%' || search_query || '%' THEN 0.10 ELSE 0 END +
+      CASE WHEN p.price_band ILIKE '%' || search_query || '%' THEN 0.05 ELSE 0 END +
+      CASE WHEN COALESCE(p.texture_desc, '') ILIKE '%' || search_query || '%' THEN 0.10 ELSE 0 END +
+      CASE WHEN COALESCE(p.explain_short, '') ILIKE '%' || search_query || '%' THEN 0.10 ELSE 0 END +
+      CASE WHEN array_to_string(p.tags, ' ') ILIKE '%' || search_query || '%' THEN 0.05 ELSE 0 END
+    )::double precision AS similarity_score
+  FROM public.products p
+  WHERE
+    p.name ILIKE '%' || search_query || '%' OR
+    p.brand ILIKE '%' || search_query || '%' OR
+    p.category ILIKE '%' || search_query || '%' OR
+    p.price_band ILIKE '%' || search_query || '%' OR
+    COALESCE(p.texture_desc, '') ILIKE '%' || search_query || '%' OR
+    COALESCE(p.explain_short, '') ILIKE '%' || search_query || '%' OR
+    array_to_string(p.tags, ' ') ILIKE '%' || search_query || '%'
+  ORDER BY similarity_score DESC, p.name ASC
+  LIMIT 30;
+$$;
+
+-- 벡터 시맨틱 검색 RPC
+CREATE OR REPLACE FUNCTION public.match_products(
+  query_embedding extensions.vector,
+  match_threshold double precision DEFAULT 0.2,
+  match_count integer DEFAULT 30
+)
+RETURNS TABLE (
+  id text,
+  similarity double precision
+)
+LANGUAGE sql STABLE
+SET search_path TO 'public', 'extensions'
+AS $$
+  SELECT
+    p.id,
+    1 - (p.embedding <=> query_embedding) AS similarity
+  FROM public.products p
+  WHERE p.embedding IS NOT NULL
+    AND 1 - (p.embedding <=> query_embedding) > match_threshold
+  ORDER BY p.embedding <=> query_embedding
+  LIMIT match_count;
+$$;
 
 ALTER TABLE public.products ENABLE ROW LEVEL SECURITY;
 
